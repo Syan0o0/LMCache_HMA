@@ -7,7 +7,11 @@ import pytest
 import torch
 
 # First Party
-from lmcache.v1.kv_layer_groups import KVLayerGroupInfo, KVLayerGroupsManager
+from lmcache.v1.kv_layer_groups import (
+    KVLayerGroupInfo,
+    KVLayerGroupKind,
+    KVLayerGroupsManager,
+)
 
 
 class TestKVLayerGroupsManager:
@@ -244,6 +248,35 @@ class TestKVLayerGroupsManager:
         assert manager.kv_layer_groups is not None
         assert len(manager.kv_layer_groups) == 1
         assert manager.kv_layer_groups[0].layer_names == ["layer_0", "layer_1"]
+
+    def test_build_kv_layer_groups_with_gdn_state_tensors(self):
+        """Test that tuple-state layers are recognized as a GDN group."""
+        manager = KVLayerGroupsManager()
+
+        kv_caches = {
+            "layer_0": (
+                torch.randn(32, 128, dtype=torch.float16),
+                torch.randn(32, 256, dtype=torch.float32),
+            ),
+            "layer_1": (
+                torch.randn(32, 128, dtype=torch.float16),
+                torch.randn(32, 256, dtype=torch.float32),
+            ),
+        }
+
+        manager.build_kv_layer_groups(kv_caches)
+
+        assert manager.kv_layer_groups is not None
+        assert len(manager.kv_layer_groups) == 1
+        group = manager.kv_layer_groups[0]
+        assert group.group_kind == KVLayerGroupKind.GDN
+        assert group.num_tensors == 2
+        assert group.tensor_specs[0].name == "conv_state"
+        assert group.tensor_specs[1].name == "ssm_state"
+        assert group.tensor_specs[0].shape == (32, 128)
+        assert group.tensor_specs[1].shape == (32, 256)
+        assert group.tensor_specs[0].dtype == torch.float16
+        assert group.tensor_specs[1].dtype == torch.float32
 
     def test_get_group_methods_after_build(self):
         """Test get_group_by_layer_idx and get_group_by_layer_name."""

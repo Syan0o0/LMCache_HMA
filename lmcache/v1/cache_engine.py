@@ -308,6 +308,19 @@ class LMCacheEngine:
         if self._is_passive():
             logger.debug(f"rank={self.metadata.worker_id} ignore store")
             return
+        
+        slot_mappings_by_group = self._normalize_slot_mappings_by_group(kwargs)
+        kwargs["slot_mappings_by_group"] = slot_mappings_by_group
+        self._set_legacy_slot_mapping_if_single_group(
+            kwargs, slot_mappings_by_group
+        )
+        block_ids_by_group = self._normalize_block_ids_by_group(kwargs)
+        if block_ids_by_group is not None:
+            kwargs["block_ids_by_group"] = block_ids_by_group
+            if len(block_ids_by_group) == 1:
+                kwargs["block_ids"] = block_ids_by_group[0]
+            elif "block_ids" in kwargs:
+                del kwargs["block_ids"]
 
         assert self.storage_manager is not None
 
@@ -323,8 +336,15 @@ class LMCacheEngine:
                 "Offsets should be set when hashes are provided during store"
             )
             num_to_store_tokens = sum(offsets)
-            kwargs["slot_mapping"] = torch.tensor(
-                kwargs["slot_mapping"], dtype=torch.long, device="cuda"
+            # kwargs["slot_mapping"] = torch.tensor(
+            #     kwargs["slot_mapping"], dtype=torch.long, device="cuda"
+            # )
+            kwargs["slot_mappings_by_group"] = tuple(
+                slot_mapping.to(device="cuda", dtype=torch.long)
+                for slot_mapping in slot_mappings_by_group
+            )
+            self._set_legacy_slot_mapping_if_single_group(
+                kwargs, kwargs["slot_mappings_by_group"]
             )
 
         assert tokens is not None or hashes is not None, (
@@ -375,8 +395,8 @@ class LMCacheEngine:
             assert isinstance(key, CacheEngineKey)
             # Allocate the memory object
             num_tokens = end - start
-            kv_shapes = self.metadata.get_shapes(num_tokens)
-            kv_dtypes = self.metadata.get_dtypes()
+            kv_shapes = self.metadata.get_transfer_shapes(num_tokens)
+            kv_dtypes = self.metadata.get_transfer_dtypes()
 
             # TODO (Jiayi): should be batched in the future
             memory_obj = self.storage_manager.allocate(
@@ -652,6 +672,19 @@ class LMCacheEngine:
         assert self.gpu_connector is not None, (
             "gpu_connector is required for retrieve operation"
         )
+
+        slot_mappings_by_group = self._normalize_slot_mappings_by_group(kwargs)
+        kwargs["slot_mappings_by_group"] = slot_mappings_by_group
+        self._set_legacy_slot_mapping_if_single_group(
+            kwargs, slot_mappings_by_group
+        )
+        block_ids_by_group = self._normalize_block_ids_by_group(kwargs)
+        if block_ids_by_group is not None:
+            kwargs["block_ids_by_group"] = block_ids_by_group
+            if len(block_ids_by_group) == 1:
+                kwargs["block_ids"] = block_ids_by_group[0]
+            elif "block_ids" in kwargs:
+                del kwargs["block_ids"]
 
         tot_kv_size = 0
         t = time.perf_counter()
@@ -1600,6 +1633,98 @@ class LMCacheEngine:
         """
         return self.save_only_first_rank and not self.metadata.is_first_rank()
 
+    def _tensorize_slot_mapping(
+        self,
+        slot_mapping: Union[torch.Tensor, List[int]],
+    ) -> torch.Tensor:
+        if isinstance(slot_mapping, torch.Tensor):
+            return slot_mapping.to(dtype=torch.long)
+        return torch.tensor(slot_mapping, dtype=torch.long)
+
+    def _normalize_slot_mappings_by_group(
+        self,
+        kwargs: dict,
+    ) -> tuple[torch.Tensor, ...]:
+        slot_mappings_by_group = kwargs.get("slot_mappings_by_group")
+        legacy_slot_mapping = kwargs.get("slot_mapping")
+
+        if slot_mappings_by_group is None and legacy_slot_mapping is None:
+            raise ValueError(
+                "Either 'slot_mappings_by_group' or 'slot_mapping' must be provided."
+            )
+
+        if slot_mappings_by_group is not None:
+            if not isinstance(slot_mappings_by_group, tuple):
+                raise ValueError(
+                    "'slot_mappings_by_group' must be a tuple of slot mappings."
+                )
+            normalized = tuple(
+                self._tensorize_slot_mapping(slot_mapping)
+                for slot_mapping in slot_mappings_by_group
+            )
+        else:
+            assert legacy_slot_mapping is not None
+            normalized = (self._tensorize_slot_mapping(legacy_slot_mapping),)
+
+        if legacy_slot_mapping is not None:
+            legacy_tensor = self._tensorize_slot_mapping(legacy_slot_mapping)
+            if len(normalized) != 1:
+                raise ValueError(
+                    "Both 'slot_mapping' and multi-group 'slot_mappings_by_group' "
+                    "were provided, which is ambiguous."
+                )
+            if not torch.equal(normalized[0], legacy_tensor):
+                raise ValueError(
+                    "'slot_mapping' and 'slot_mappings_by_group[0]' do not match."
+                )
+
+        return normalized
+
+    def _normalize_block_ids_by_group(
+        self,
+        kwargs: dict,
+    ) -> Optional[tuple[list[int], ...]]:
+        block_ids_by_group = kwargs.get("block_ids_by_group")
+        legacy_block_ids = kwargs.get("block_ids")
+
+        if block_ids_by_group is None and legacy_block_ids is None:
+            return None
+
+        if block_ids_by_group is not None:
+            if not isinstance(block_ids_by_group, tuple):
+                raise ValueError(
+                    "'block_ids_by_group' must be a tuple of block id lists."
+                )
+            normalized = tuple(
+                list(group_block_ids) for group_block_ids in block_ids_by_group
+            )
+        else:
+            assert legacy_block_ids is not None
+            normalized = (list(legacy_block_ids),)
+
+        if legacy_block_ids is not None:
+            if len(normalized) != 1:
+                raise ValueError(
+                    "Both 'block_ids' and multi-group 'block_ids_by_group' were "
+                    "provided, which is ambiguous."
+                )
+            if normalized[0] != list(legacy_block_ids):
+                raise ValueError(
+                    "'block_ids' and 'block_ids_by_group[0]' do not match."
+                )
+
+        return normalized
+
+    def _set_legacy_slot_mapping_if_single_group(
+        self,
+        kwargs: dict,
+        slot_mappings_by_group: tuple[torch.Tensor, ...],
+    ) -> None:
+        if len(slot_mappings_by_group) == 1:
+            kwargs["slot_mapping"] = slot_mappings_by_group[0]
+        elif "slot_mapping" in kwargs:
+            del kwargs["slot_mapping"]
+
     def _get_slot_mapping_list(
         self,
         slot_mapping: Optional[Union[torch.Tensor, List[int]]],
@@ -1619,6 +1744,15 @@ class LMCacheEngine:
             return slot_mapping.tolist()
         # At this point, slot_mapping must be List[int]
         return slot_mapping
+
+    def _get_slot_mappings_by_group_list(
+        self,
+        slot_mappings_by_group: tuple[torch.Tensor, ...],
+    ) -> List[List[int]]:
+        return [
+            self._get_slot_mapping_list(slot_mapping) or []
+            for slot_mapping in slot_mappings_by_group
+        ]
 
     def _log_kvcache_for_check(
         self,
@@ -1642,8 +1776,16 @@ class LMCacheEngine:
         if not self.kvcache_check_log_enabled:
             return
 
-        slot_mapping = kwargs.get("slot_mapping")
-        if slot_mapping is None:
+        # slot_mapping = kwargs.get("slot_mapping")
+        # if slot_mapping is None:
+        slot_mappings_by_group = kwargs.get("slot_mappings_by_group")
+        if slot_mappings_by_group is None:
+            slot_mapping = kwargs.get("slot_mapping")
+            if slot_mapping is None:
+                return
+            slot_mappings_by_group = (slot_mapping,)
+
+        if not isinstance(slot_mappings_by_group, tuple):
             return
 
         if require_req_id:
@@ -1653,18 +1795,45 @@ class LMCacheEngine:
         else:
             req_id = kwargs.get("req_id", "unspecified")
 
-        # Convert slot_mapping to list if it's a tensor
-        slot_mapping_list = self._get_slot_mapping_list(slot_mapping)
-        # slot_mapping_list should not be None when slot_mapping is not None
-        assert slot_mapping_list is not None
+        # # Convert slot_mapping to list if it's a tensor
+        # slot_mapping_list = self._get_slot_mapping_list(slot_mapping)
+        # # slot_mapping_list should not be None when slot_mapping is not None
+        # assert slot_mapping_list is not None
 
-        logger.info(
-            "[KVCache Check] %s request %s, tokens=%d, slot_mapping: %s",
-            operation,
-            req_id,
-            token_count,
-            compress_slot_mapping(slot_mapping_list),
+        # logger.info(
+        #     "[KVCache Check] %s request %s, tokens=%d, slot_mapping: %s",
+        #     operation,
+        #     req_id,
+        #     token_count,
+        #     compress_slot_mapping(slot_mapping_list),
+        # )
+        slot_mapping_lists = self._get_slot_mappings_by_group_list(
+            tuple(
+                self._tensorize_slot_mapping(slot_mapping)
+                for slot_mapping in slot_mappings_by_group
+            )
         )
+
+        if len(slot_mapping_lists) == 1:
+            logger.info(
+                "[KVCache Check] %s request %s, tokens=%d, slot_mapping: %s",
+                operation,
+                req_id,
+                token_count,
+                compress_slot_mapping(slot_mapping_lists[0]),
+            )
+        else:
+            per_group = ", ".join(
+                f"group{idx}={compress_slot_mapping(slot_mapping)}"
+                for idx, slot_mapping in enumerate(slot_mapping_lists)
+            )
+            logger.info(
+                "[KVCache Check] %s request %s, tokens=%d, slot_mappings_by_group: %s",
+                operation,
+                req_id,
+                token_count,
+                per_group,
+            )
 
 
 class LMCacheEngineBuilder:
