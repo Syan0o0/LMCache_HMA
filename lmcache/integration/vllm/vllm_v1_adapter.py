@@ -67,7 +67,10 @@ from lmcache.v1.gpu_connector import (
     VLLMPagedMemLayerwiseGPUConnector,
 )
 from lmcache.v1.internal_api_server.api_server import InternalAPIServer
-from lmcache.v1.kv_layer_groups import KVLayerGroupKind
+from lmcache.v1.kv_layer_groups import (
+    KVLayerGroupInfo,
+    KVLayerGroupKind,
+)
 from lmcache.v1.lookup_client import LookupClientFactory
 from lmcache.v1.lookup_client.lmcache_async_lookup_client import (
     LMCacheAsyncLookupServer,
@@ -1037,6 +1040,73 @@ class LMCacheConnectorV1Impl:
             return
         self.lmcache_engine.metadata.kv_group_block_sizes = self._block_sizes_by_group
 
+    def _build_vllm_aligned_kv_layer_groups(self) -> None:
+        assert self.lmcache_engine is not None
+        assert self._kv_cache_config is not None
+        assert len(self.kv_caches) > 0
+
+        kv_layer_groups_manager = self.lmcache_engine.metadata.kv_layer_groups_manager
+        if kv_layer_groups_manager.kv_layer_groups:
+            return
+
+        kv_cache_items = list(self.kv_caches.items())
+        layer_name_to_index = {
+            layer_name: layer_idx
+            for layer_idx, (layer_name, _) in enumerate(kv_cache_items)
+        }
+
+        kv_layer_groups: list[KVLayerGroupInfo] = []
+        for group_idx, group_spec in enumerate(self._kv_cache_config.kv_cache_groups):
+            group_layer_names: list[str] = []
+            group_layer_indices: list[int] = []
+            representative_cache = None
+
+            for layer_name in group_spec.layer_names:
+                if layer_name not in self.kv_caches:
+                    logger.debug(
+                        "Skipping layer %s while building vLLM-aligned KV group %d "
+                        "because it is absent from registered kv_caches.",
+                        layer_name,
+                        group_idx,
+                    )
+                    continue
+
+                group_layer_names.append(layer_name)
+                group_layer_indices.append(layer_name_to_index[layer_name])
+                if representative_cache is None:
+                    representative_cache = self.kv_caches[layer_name]
+
+            if representative_cache is None:
+                raise ValueError(
+                    "Failed to build vLLM-aligned KV layer groups because "
+                    f"kv_cache_group[{group_idx}] with layers {group_spec.layer_names} "
+                    "has no matching runtime kv caches."
+                )
+
+            group_kind, tensor_specs = (
+                kv_layer_groups_manager._infer_group_kind_and_tensor_specs(
+                    representative_cache
+                )
+            )
+
+            kv_layer_groups.append(
+                KVLayerGroupInfo(
+                    layer_names=group_layer_names,
+                    layer_indices=group_layer_indices,
+                    shape=tensor_specs[0].shape,
+                    dtype=tensor_specs[0].dtype,
+                    group_kind=group_kind,
+                    tensor_specs=tensor_specs,
+                )
+            )
+
+        kv_layer_groups_manager.kv_layer_groups = kv_layer_groups
+        logger.info(
+            "Built vLLM-aligned KV layer groups: num_vllm_groups=%d, groups=%s",
+            len(kv_layer_groups),
+            kv_layer_groups,
+        )
+
     def _validate_gdn_chunk_alignment(self) -> None:
         if self.lmcache_engine is None:
             return
@@ -1183,7 +1253,12 @@ class LMCacheConnectorV1Impl:
             kv_layer_groups_manager = (
                 self.lmcache_engine.metadata.kv_layer_groups_manager
             )
-            kv_layer_groups_manager.build_kv_layer_groups(self.kv_caches)
+            if self._kv_cache_config is not None and len(
+                self._kv_cache_config.kv_cache_groups
+            ) > 1:
+                self._build_vllm_aligned_kv_layer_groups()
+            else:
+                kv_layer_groups_manager.build_kv_layer_groups(self.kv_caches)
             self._sync_kv_group_metadata()
             self._validate_gdn_chunk_alignment()
 
