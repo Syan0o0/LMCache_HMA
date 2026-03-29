@@ -88,9 +88,10 @@ def evaluate(args, llm, subject, dev_df, test_df):
     for prompt in prompts:
         # if we use lmcache, we need to first populate the kv cache
         if args.use_lmcache:
-            llm.generate(prompt, sampling_params)
+            llm.generate(prompt, sampling_params, use_tqdm=False)
             time.sleep(0.5)
-        outputs.append(llm.generate(prompt, sampling_params))
+        result = llm.generate(prompt, sampling_params, use_tqdm=False)
+        outputs.append(result[0])
         time.sleep(0.5)
 
     predictions = []

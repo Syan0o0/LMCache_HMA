@@ -4,6 +4,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
+import hashlib
 import os
 
 # Third Party
@@ -225,6 +226,35 @@ def _build_slot_mappings_by_group(
             block_ids_by_group, block_sizes_by_group, strict=True
         )
     )
+
+
+def _summarize_int_sequence(values: Iterable[int], limit: int = 6) -> str:
+    values_list = [int(v) for v in values]
+    length = len(values_list)
+    if length == 0:
+        return "len=0 values=[]"
+    if length <= limit * 2:
+        return f"len={length} values={values_list}"
+    head = values_list[:limit]
+    tail = values_list[-limit:]
+    return f"len={length} head={head} tail={tail}"
+
+
+def _summarize_block_groups(
+    block_ids_by_group: tuple[list[int], ...],
+    limit: int = 6,
+) -> str:
+    group_summaries = [
+        f"group{group_idx}:{_summarize_int_sequence(group_block_ids, limit)}"
+        for group_idx, group_block_ids in enumerate(block_ids_by_group)
+    ]
+    return "; ".join(group_summaries)
+
+
+def _stable_token_fingerprint(token_ids: list[int]) -> str:
+    digest = hashlib.blake2s(digest_size=6)
+    digest.update(",".join(str(int(token)) for token in token_ids).encode("utf-8"))
+    return digest.hexdigest()
 
 @dataclass
 class RequestTracker:
@@ -586,11 +616,16 @@ class ReqMeta:
         
         # For load operation: check whether the request is scheduled to load
         if load_spec is not None and load_spec.can_load:
-            logger.debug(
-                "Scheduled to load %d tokens (%d cached in vLLM) for request %s",
+            logger.warning(
+                "Scheduled external load req_id=%s prompt_tokens=%d "
+                "prompt_fp=%s lmcache_cached_tokens=%d vllm_cached_tokens=%d "
+                "block_groups=%s",
+                tracker.req_id,
+                len(token_ids),
+                _stable_token_fingerprint(token_ids),
                 load_spec.lmcache_cached_tokens,
                 load_spec.vllm_cached_tokens,
-                tracker.req_id,
+                _summarize_block_groups(tracker.allocated_block_ids_by_group),
             )
         else:
             # Do not load if not in `can_load` state
@@ -1944,6 +1979,27 @@ class LMCacheConnectorV1Impl:
             need_to_allocate,
         )
 
+        if need_to_allocate > 0:
+            debug_token_ids = list(request.all_token_ids)
+            if self.skip_last_n_tokens > 0:
+                debug_token_ids = debug_token_ids[: -self.skip_last_n_tokens]
+            load_token_ids = debug_token_ids[:num_external_hit_tokens]
+            logger.warning(
+                "External load lookup plan req_id=%s prompt_tokens=%d "
+                "prompt_fp=%s load_fp=%s vllm_cached_tokens=%d "
+                "lmcache_cached_tokens=%d expected_load_tokens=%d "
+                "request_configs=%s load_token_summary=%s",
+                req_id,
+                len(debug_token_ids),
+                _stable_token_fingerprint(debug_token_ids),
+                _stable_token_fingerprint(load_token_ids),
+                num_computed_tokens,
+                num_external_hit_tokens,
+                need_to_allocate,
+                request_configs,
+                _summarize_int_sequence(load_token_ids),
+            )
+
         self.load_specs[req_id] = LoadSpec(
             vllm_cached_tokens=num_computed_tokens,
             lmcache_cached_tokens=num_external_hit_tokens,
@@ -2003,6 +2059,15 @@ class LMCacheConnectorV1Impl:
         if num_external_tokens == 0:
             # No need to load anything
             self.load_specs[request.request_id].can_load = False
+            logger.info(
+                "External load skipped after alloc req_id=%s prompt_tokens=%d "
+                "prompt_fp=%s lmcache_cached_tokens=%d vllm_cached_tokens=%d",
+                request.request_id,
+                request.num_tokens,
+                _stable_token_fingerprint(list(request.all_token_ids)),
+                self.load_specs[request.request_id].lmcache_cached_tokens,
+                self.load_specs[request.request_id].vllm_cached_tokens,
+            )
             return
 
         recalc_last = (
@@ -2030,6 +2095,18 @@ class LMCacheConnectorV1Impl:
         )
 
         self.load_specs[request.request_id].can_load = True
+        logger.warning(
+            "External load allocation ready req_id=%s prompt_tokens=%d "
+            "prompt_fp=%s allowed_load_tokens=%d lmcache_cached_tokens=%d "
+            "vllm_cached_tokens=%d full_hit_recalc_last=%d",
+            request.request_id,
+            request.num_tokens,
+            _stable_token_fingerprint(list(request.all_token_ids)),
+            num_external_tokens,
+            self.load_specs[request.request_id].lmcache_cached_tokens,
+            self.load_specs[request.request_id].vllm_cached_tokens,
+            recalc_last,
+        )
 
     @_lmcache_nvtx_annotate
     def build_connector_meta(
