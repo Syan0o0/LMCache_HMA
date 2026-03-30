@@ -1961,14 +1961,16 @@ class LMCacheConnectorV1Impl:
             )
             return None
 
-        # When prompt length is divisible by the block size and all
-        # blocks are cached, we need to recompute the last token.
-        # This will be removed in the future if vLLM's scheduler provides
-        # a better support for this case.
+        # Boundary-token experiment:
+        # whenever external KV extends beyond what vLLM already has locally,
+        # leave the last cached token to be recomputed together with the tail.
+        # Full-prompt-hit still needs this for first-token logits, and we also
+        # apply it to partial hits to validate whether hybrid tail-prefill
+        # needs a bridge token at the cache boundary.
         need_to_allocate = num_external_hit_tokens - num_computed_tokens
 
-        # In, full-prompt-hit case, we need to recompute the last token
-        if num_external_hit_tokens == request.num_tokens:
+        boundary_recalc_last = 1 if need_to_allocate > 0 else 0
+        if boundary_recalc_last:
             need_to_allocate -= 1
 
         logger.info(
@@ -2074,7 +2076,7 @@ class LMCacheConnectorV1Impl:
             1
             if (
                 self.load_specs[request.request_id].lmcache_cached_tokens
-                == request.num_tokens
+                > self.load_specs[request.request_id].vllm_cached_tokens
             )
             else 0
         )
@@ -2090,7 +2092,7 @@ class LMCacheConnectorV1Impl:
             f"{self.load_specs[request.request_id].vllm_cached_tokens} "
             "(tokens in vllm) - "
             f"{recalc_last} "
-            "(full lmcache hits subtracts last token to recalculate logits)"
+            "(boundary recalc subtracts one token to recompute the cache/tail seam)"
             f" for request {request.request_id}"
         )
 
@@ -2098,7 +2100,7 @@ class LMCacheConnectorV1Impl:
         logger.warning(
             "External load allocation ready req_id=%s prompt_tokens=%d "
             "prompt_fp=%s allowed_load_tokens=%d lmcache_cached_tokens=%d "
-            "vllm_cached_tokens=%d full_hit_recalc_last=%d",
+            "vllm_cached_tokens=%d boundary_recalc_last=%d",
             request.request_id,
             request.num_tokens,
             _stable_token_fingerprint(list(request.all_token_ids)),
