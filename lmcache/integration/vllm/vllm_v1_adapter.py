@@ -1990,7 +1990,7 @@ class LMCacheConnectorV1Impl:
                 "External load lookup plan req_id=%s prompt_tokens=%d "
                 "prompt_fp=%s load_fp=%s vllm_cached_tokens=%d "
                 "lmcache_cached_tokens=%d expected_load_tokens=%d "
-                "request_configs=%s load_token_summary=%s",
+                "load_token_summary=%s",
                 req_id,
                 len(debug_token_ids),
                 _stable_token_fingerprint(debug_token_ids),
@@ -1998,7 +1998,6 @@ class LMCacheConnectorV1Impl:
                 num_computed_tokens,
                 num_external_hit_tokens,
                 need_to_allocate,
-                request_configs,
                 _summarize_int_sequence(load_token_ids),
             )
 
@@ -2229,6 +2228,14 @@ class LMCacheConnectorV1Impl:
         for i, req_id in enumerate(cached_reqs.req_ids):
             request_tracker = self._request_trackers[req_id]
             num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            # scheduler_output.num_scheduled_tokens may include speculative
+            # draft tokens, while request.all_token_ids only contains
+            # committed tokens. Keep the save-path token progression aligned
+            # with lookup by explicitly removing scheduled spec tokens here.
+            num_new_tokens -= len(
+                scheduler_output.scheduled_spec_decode_tokens.get(req_id, ())
+            )
+            num_new_tokens = max(0, num_new_tokens)
             # TODO: this is a dangerous reference to the request object inside vllm
             if request := self._unfinished_requests.get(req_id):
                 num_current_tokens = request.num_computed_tokens
