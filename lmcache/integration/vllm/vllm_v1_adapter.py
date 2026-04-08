@@ -547,6 +547,22 @@ class ReqMeta:
         )
 
         if skip_save and load_spec is None:
+            logger.info(
+                "Save metadata skipped req_id=%s input_token_len=%d "
+                "prompt_len=%d num_saved_tokens=%d chunk_boundary=%d "
+                "is_last_prefill=%s is_decode_phase=%s tracker_skip_save=%s "
+                "request_skip=%s load_spec_present=%s",
+                tracker.req_id,
+                input_token_len,
+                tracker.prompt_len,
+                tracker.num_saved_tokens,
+                chunk_boundary,
+                is_last_prefill,
+                tracker.is_decode_phase,
+                tracker.skip_save,
+                request_skip,
+                load_spec is not None,
+            )
             return None
 
         # Calculate number of tokens to save based on discard_partial_chunks
@@ -1682,6 +1698,29 @@ class LMCacheConnectorV1Impl:
 
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
+
+        request_summaries: list[str] = []
+        for request in connector_metadata.requests:
+            save_spec = request.save_spec
+            token_count = len(request.token_ids)
+            can_save = save_spec.can_save if save_spec is not None else False
+            skip_leading_tokens = (
+                save_spec.skip_leading_tokens if save_spec is not None else None
+            )
+            request_summaries.append(
+                f"{request.req_id}:tokens={token_count},"
+                f"can_save={can_save},"
+                f"skip_leading_tokens={skip_leading_tokens},"
+                f"is_last_prefill={request.is_last_prefill}"
+            )
+        logger.info(
+            "wait_for_save entered request_count=%d kv_role=%s use_layerwise=%s "
+            "requests=[%s]",
+            len(connector_metadata.requests),
+            self.kv_role,
+            self.use_layerwise,
+            "; ".join(request_summaries),
+        )
 
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
