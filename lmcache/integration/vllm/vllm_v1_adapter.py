@@ -1699,29 +1699,6 @@ class LMCacheConnectorV1Impl:
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
 
-        request_summaries: list[str] = []
-        for request in connector_metadata.requests:
-            save_spec = request.save_spec
-            token_count = len(request.token_ids)
-            can_save = save_spec.can_save if save_spec is not None else False
-            skip_leading_tokens = (
-                save_spec.skip_leading_tokens if save_spec is not None else None
-            )
-            request_summaries.append(
-                f"{request.req_id}:tokens={token_count},"
-                f"can_save={can_save},"
-                f"skip_leading_tokens={skip_leading_tokens},"
-                f"is_last_prefill={request.is_last_prefill}"
-            )
-        logger.info(
-            "wait_for_save entered request_count=%d kv_role=%s use_layerwise=%s "
-            "requests=[%s]",
-            len(connector_metadata.requests),
-            self.kv_role,
-            self.use_layerwise,
-            "; ".join(request_summaries),
-        )
-
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
             return
