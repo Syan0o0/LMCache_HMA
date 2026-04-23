@@ -101,6 +101,32 @@ class LoadSpec:
     # Whether the scheduler allow us to load the tokens
     can_load: bool
 
+    @property
+    def boundary_recalc_last(self) -> int:
+        return 1 if self.lmcache_cached_tokens > self.vllm_cached_tokens else 0
+
+    @property
+    def effective_computed_tokens(self) -> int:
+        return _effective_computed_tokens(
+            self.vllm_cached_tokens,
+            self.lmcache_cached_tokens,
+        )
+
+
+def _boundary_recalc_last(vllm_cached_tokens: int, lmcache_cached_tokens: int) -> int:
+    return 1 if lmcache_cached_tokens > vllm_cached_tokens else 0
+
+
+def _effective_computed_tokens(
+    vllm_cached_tokens: int,
+    lmcache_cached_tokens: int,
+) -> int:
+    return max(
+        vllm_cached_tokens,
+        lmcache_cached_tokens
+        - _boundary_recalc_last(vllm_cached_tokens, lmcache_cached_tokens),
+    )
+
 
 @dataclass
 class SaveSpec:
@@ -420,7 +446,10 @@ class RequestTracker:
             self.allocated_block_ids_by_group = new_block_ids_by_group
             # reset the number of saved tokens
             self.num_saved_tokens = lmcache_cached_tokens
-            num_computed_tokens = max(lmcache_cached_tokens, vllm_cached_tokens)
+            num_computed_tokens = _effective_computed_tokens(
+                vllm_cached_tokens,
+                lmcache_cached_tokens,
+            )
 
             # FIX: For preempted requests, restore token_ids from the full
             # token list to ensure chunk keys match what was used during
@@ -2087,14 +2116,7 @@ class LMCacheConnectorV1Impl:
             )
             return
 
-        recalc_last = (
-            1
-            if (
-                self.load_specs[request.request_id].lmcache_cached_tokens
-                > self.load_specs[request.request_id].vllm_cached_tokens
-            )
-            else 0
-        )
+        recalc_last = self.load_specs[request.request_id].boundary_recalc_last
         assert (
             num_external_tokens
             == self.load_specs[request.request_id].lmcache_cached_tokens
@@ -2290,17 +2312,18 @@ class LMCacheConnectorV1Impl:
                 assert load_spec is not None, (
                     f"Request {req_id} is preempted but was not given a load spec"
                 )
-                # num_computed_tokens should be reset to 0 during preemption
-                # and then set to the number of already cached tokens (maxxing
-                # prefix caching and lmcache)
-                # this assumption is crucial for the update() call of RequestTracker
-                assert request.num_computed_tokens == max(
-                    lmcache_cached_tokens, load_spec.vllm_cached_tokens
-                ), (
+                # For partial-hit seam recovery, the scheduler only trusts
+                # effective_computed_tokens rather than the raw LMCache hit
+                # length. This must stay consistent with RequestTracker.update().
+                expected_num_computed_tokens = load_spec.effective_computed_tokens
+                assert request.num_computed_tokens == expected_num_computed_tokens, (
                     f"Preempted request {req_id} has "
                     f"num_computed_tokens {request.num_computed_tokens} "
-                    "but max(lmcache_cached_tokens, vllm_cached_tokens) = "
-                    f"{max(lmcache_cached_tokens, vllm_cached_tokens)}"
+                    "but effective_computed_tokens = "
+                    f"{expected_num_computed_tokens} "
+                    f"(lmcache_cached_tokens={lmcache_cached_tokens}, "
+                    f"vllm_cached_tokens={load_spec.vllm_cached_tokens}, "
+                    f"boundary_recalc_last={load_spec.boundary_recalc_last})"
                 )
 
             # Pass all_token_ids for preempted requests to restore
