@@ -576,7 +576,7 @@ class ReqMeta:
         )
 
         if skip_save and load_spec is None:
-            logger.info(
+            logger.debug(
                 "Save metadata skipped req_id=%s input_token_len=%d "
                 "prompt_len=%d num_saved_tokens=%d chunk_boundary=%d "
                 "is_last_prefill=%s is_decode_phase=%s tracker_skip_save=%s "
