@@ -2,7 +2,8 @@
 # Standard
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Optional
+from enum import Enum
+from typing import Optional, Sequence
 
 # Third Party
 import torch
@@ -11,6 +12,18 @@ import torch
 from lmcache.logging import init_logger
 
 logger = init_logger(__name__)
+
+
+class KVLayerGroupKind(str, Enum):
+    ATTENTION = "attention"
+    GDN = "gdn"
+
+
+@dataclass(frozen=True)
+class KVLayerTensorSpec:
+    name: str
+    shape: torch.Size
+    dtype: torch.dtype
 
 
 @dataclass
@@ -28,9 +41,13 @@ class KVLayerGroupInfo:
     """ Shape of the KV cache tensor for layers in this group """
     """ For MHA: typically [2, num_blocks, block_size, num_heads, head_size] """
     """ For MLA: typically [num_blocks, block_size, head_size] """
-    shape: torch.Size
+    shape: Optional[torch.Size] = None
     """ Data type of the KV cache tensor for layers in this group """
-    dtype: torch.dtype
+    dtype: Optional[torch.dtype] = None
+    """ Logical group kind. """
+    group_kind: KVLayerGroupKind = KVLayerGroupKind.ATTENTION
+    """ Tensor layout specs for this group. """
+    tensor_specs: list[KVLayerTensorSpec] = field(default_factory=list)
 
     # Internal sets for fast membership checking
     _layer_indices_set: set[int] = field(init=False, repr=False)
@@ -38,6 +55,27 @@ class KVLayerGroupInfo:
 
     def __post_init__(self):
         """Initialize sets for fast membership checking."""
+        if not self.tensor_specs:
+            if self.shape is None or self.dtype is None:
+                raise ValueError(
+                    "Either tensor_specs or both shape/dtype must be provided."
+                )
+            self.tensor_specs = [
+                KVLayerTensorSpec(
+                    name="primary",
+                    shape=torch.Size(self.shape),
+                    dtype=self.dtype,
+                )
+            ]
+        else:
+            self.tensor_specs = list(self.tensor_specs)
+            if self.shape is None:
+                self.shape = self.tensor_specs[0].shape
+            if self.dtype is None:
+                self.dtype = self.tensor_specs[0].dtype
+
+        assert self.shape is not None
+        assert self.dtype is not None
         self._layer_indices_set = set(self.layer_indices)
         self._layer_names_set = set(self.layer_names)
 
@@ -49,7 +87,9 @@ class KVLayerGroupInfo:
         return (
             f"KVLayerGroupInfo(layers={len(self.layer_names)}, "
             f"indices={indices_repr}, "
-            f"shape={self.shape}, dtype={self.dtype})"
+            f"kind={self.group_kind}, "
+            f"shape={self.shape}, dtype={self.dtype}, "
+            f"num_tensors={self.num_tensors})"
         )
 
     @property
@@ -58,9 +98,27 @@ class KVLayerGroupInfo:
         return len(self.layer_names)
 
     @property
+    def primary_tensor_spec(self) -> KVLayerTensorSpec:
+        return self.tensor_specs[0]
+
+    @property
+    def num_tensors(self) -> int:
+        return len(self.tensor_specs)
+
+    @property
+    def tensor_shapes(self) -> list[torch.Size]:
+        return [tensor_spec.shape for tensor_spec in self.tensor_specs]
+
+    @property
+    def tensor_dtypes(self) -> list[torch.dtype]:
+        return [tensor_spec.dtype for tensor_spec in self.tensor_specs]
+
+    @property
     def hidden_dim_size(self) -> int:
         """Return the size of the hidden dimension in this group."""
         # hidden_dim_size = num_heads * head_size
+        if self.shape is None:
+            raise ValueError("Group shape is not initialized")
         if len(self.shape) == 5:
             # MHA
             return self.shape[3] * self.shape[4]
@@ -146,7 +204,70 @@ class KVLayerGroupsManager:
         group = self.get_group_by_layer_idx(layer_idx)
         return group.dtype if group else None
 
-    def build_kv_layer_groups(self, kv_caches: dict[str, torch.Tensor]) -> None:
+    def get_group_kind(self, group_idx: int) -> KVLayerGroupKind:
+        return self.kv_layer_groups[group_idx].group_kind
+
+    def group_has_multiple_tensors(self, group_idx: int) -> bool:
+        return self.kv_layer_groups[group_idx].num_tensors > 1
+
+    def _infer_group_kind_and_tensor_specs(
+        self,
+        kv_cache: torch.Tensor | Sequence[torch.Tensor],
+    ) -> tuple[KVLayerGroupKind, list[KVLayerTensorSpec]]:
+        """Infer the logical KV group kind and per-tensor layout.
+
+        Supported runtime KV cache forms:
+        - Single-tensor format: one tensor, typically shaped like
+          [2, num_blocks, block_size, num_heads, head_size].
+        - Sequence format: a tuple/list of tensors.
+          For attention-style K/V caches this is typically [k_tensor, v_tensor],
+          where each tensor has shape
+          [num_blocks, block_size, num_heads, head_size].
+          Other multi-tensor layouts are treated as GDN/state groups.
+        """
+        if isinstance(kv_cache, torch.Tensor):
+            return (
+                KVLayerGroupKind.ATTENTION,
+                [
+                    KVLayerTensorSpec(
+                        name="kv",
+                        shape=kv_cache.shape,
+                        dtype=kv_cache.dtype,
+                    )
+                ],
+            )
+
+        if not isinstance(kv_cache, Sequence) or len(kv_cache) == 0:
+            raise RuntimeError(f"Unknown KVCache type: {type(kv_cache)}")
+
+        tensors = list(kv_cache)
+        if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
+            raise RuntimeError(f"Unknown KVCache element type: {type(kv_cache)}")
+
+        is_attention_pair = (
+            len(tensors) == 2
+            and tensors[0].shape == tensors[1].shape
+            and tensors[0].dtype == tensors[1].dtype
+            and tensors[0].ndim >= 4
+        )
+        group_kind = (
+            KVLayerGroupKind.ATTENTION if is_attention_pair else KVLayerGroupKind.GDN
+        )
+        names = ["k", "v"] if is_attention_pair else (
+            ["conv_state", "ssm_state"]
+            if len(tensors) == 2
+            else [f"tensor_{idx}" for idx in range(len(tensors))]
+        )
+        tensor_specs = [
+            KVLayerTensorSpec(name=name, shape=tensor.shape, dtype=tensor.dtype)
+            for name, tensor in zip(names, tensors, strict=True)
+        ]
+        return group_kind, tensor_specs
+
+    def build_kv_layer_groups(
+        self,
+        kv_caches: dict[str, torch.Tensor | Sequence[torch.Tensor]],
+    ) -> None:
         """Build KV layer groups structure by analyzing each layer's shape and dtype.
 
         Layers with the same shape and dtype are grouped together. This is useful
@@ -167,34 +288,32 @@ class KVLayerGroupsManager:
             logger.debug("No KV caches available, skipping KV layer groups building")
             return
 
-        # Group layers by (shape, dtype) in a single loop
-        groups_dict: dict[tuple[torch.Size, torch.dtype], list[tuple[str, int]]] = (
-            defaultdict(list)
-        )
+        # Group layers by logical KV layout in a single loop.
+        groups_dict: dict[
+            tuple[
+                KVLayerGroupKind,
+                tuple[tuple[str, torch.Size, torch.dtype], ...],
+            ],
+            list[tuple[str, int]],
+        ] = defaultdict(list)
+        group_specs: dict[
+            tuple[
+                KVLayerGroupKind,
+                tuple[tuple[str, torch.Size, torch.dtype], ...],
+            ],
+            list[KVLayerTensorSpec],
+        ] = {}
 
         for idx, (layer_name, kv_cache) in enumerate(kv_caches.items()):
-            # Supports two KV cache formats:
-            # - Single-tensor format: a single tensor with shape
-            #   [2, num_blocks, block_size, num_heads, head_size].
-            # - List/tuple format (e.g., TPU/HPU): [k_tensor, v_tensor],
-            #   where each tensor has shape
-            #   [num_blocks, block_size, num_heads, head_size].
-            if isinstance(kv_cache, (tuple, list)):
-                if len(kv_cache) != 2:
-                    raise ValueError(
-                        f"Expected 2 tensors (k, v) for layer {layer_name}, "
-                        f"got {len(kv_cache)}"
-                    )
-                # Prepend the count as a leading dimension to produce the
-                # same canonical shape as the single-tensor format
-                # (e.g., [2, num_blocks, ...] for k+v), so downstream
-                # indexing (e.g., hidden_dim_size) is unaffected.
-                shape = torch.Size([len(kv_cache)] + list(kv_cache[0].shape))
-                dtype = kv_cache[0].dtype
-            else:
-                shape = kv_cache.shape
-                dtype = kv_cache.dtype
-            key = (shape, dtype)
+            group_kind, tensor_specs = self._infer_group_kind_and_tensor_specs(kv_cache)
+            key = (
+                group_kind,
+                tuple(
+                    (tensor_spec.name, tensor_spec.shape, tensor_spec.dtype)
+                    for tensor_spec in tensor_specs
+                ),
+            )
+            group_specs[key] = tensor_specs
             groups_dict[key].append((layer_name, idx))
 
         # Build KVLayerGroupInfo list
@@ -211,15 +330,19 @@ class KVLayerGroupsManager:
         sorted_keys = sorted(groups_dict.keys(), key=_get_first_layer_index)
 
         kv_layer_groups: list[KVLayerGroupInfo] = []
-        for shape, dtype in sorted_keys:
-            layers = groups_dict[(shape, dtype)]
+        for key in sorted_keys:
+            layers = groups_dict[key]
             layer_names, layer_indices = zip(*layers, strict=False)
+            group_kind = key[0]
+            tensor_specs = group_specs[key]
 
             group_info = KVLayerGroupInfo(
                 layer_names=list(layer_names),
                 layer_indices=list(layer_indices),
-                shape=shape,
-                dtype=dtype,
+                shape=tensor_specs[0].shape,
+                dtype=tensor_specs[0].dtype,
+                group_kind=group_kind,
+                tensor_specs=tensor_specs,
             )
             kv_layer_groups.append(group_info)
 
