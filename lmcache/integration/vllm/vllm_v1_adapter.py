@@ -102,6 +102,131 @@ def extract_request_configs(sampling_params: SamplingParams) -> Optional[dict]:
     return request_configs
 
 
+BlockIdsLike = Optional[Union[list[int], list[list[int]], tuple[list[int], ...]]]
+
+
+def _empty_block_ids_by_group(num_groups: int) -> tuple[list[int], ...]:
+    if num_groups < 1:
+        raise ValueError(f"num_groups must be >= 1, got {num_groups}")
+    return tuple([] for _ in range(num_groups))
+
+
+def _normalize_block_ids(
+    block_ids: BlockIdsLike,
+    expected_num_groups: int,
+) -> tuple[list[int], ...]:
+    """Normalize vLLM block ids into one list per KV cache group.
+
+    vLLM has used both flat single-group block id lists and grouped
+    tuple/list layouts across releases. Keep the normalized representation
+    grouped so mixed KV-cache models can preserve each group's allocation.
+    """
+    if expected_num_groups < 1:
+        raise ValueError(
+            f"expected_num_groups must be >= 1, got {expected_num_groups}"
+        )
+
+    if block_ids is None:
+        return _empty_block_ids_by_group(expected_num_groups)
+
+    if isinstance(block_ids, list):
+        if len(block_ids) == 0:
+            return _empty_block_ids_by_group(expected_num_groups)
+
+        if all(
+            isinstance(group_block_ids, (list, tuple))
+            for group_block_ids in block_ids
+        ):
+            if len(block_ids) != expected_num_groups:
+                raise ValueError(
+                    "Block group count mismatch: "
+                    f"expected {expected_num_groups}, got {len(block_ids)}"
+                )
+            return tuple(list(group_block_ids) for group_block_ids in block_ids)
+
+        if expected_num_groups != 1:
+            raise ValueError(
+                "Received single-group block_ids for a multi-group request: "
+                f"expected_num_groups={expected_num_groups}"
+            )
+        return (block_ids.copy(),)
+
+    if isinstance(block_ids, tuple):
+        if len(block_ids) != expected_num_groups:
+            raise ValueError(
+                "Block group count mismatch: "
+                f"expected {expected_num_groups}, got {len(block_ids)}"
+            )
+        return tuple(list(group_block_ids) for group_block_ids in block_ids)
+
+    raise ValueError(f"Unsupported block_ids type: {type(block_ids)}")
+
+
+def _normalize_block_sizes(
+    block_sizes: Union[int, tuple[int, ...], list[int]],
+    expected_num_groups: int,
+) -> tuple[int, ...]:
+    if isinstance(block_sizes, int):
+        block_sizes_by_group = (block_sizes,)
+    else:
+        block_sizes_by_group = tuple(block_sizes)
+
+    if len(block_sizes_by_group) != expected_num_groups:
+        raise ValueError(
+            "Block size group count mismatch: "
+            f"expected {expected_num_groups}, got {len(block_sizes_by_group)}"
+        )
+    return block_sizes_by_group
+
+
+def _build_slot_mapping_for_group(
+    block_ids: list[int],
+    block_size: int,
+    num_tokens: int,
+) -> torch.Tensor:
+    if num_tokens == 0:
+        return torch.empty(0, dtype=torch.long)
+
+    num_blocks = len(block_ids)
+    if num_tokens > num_blocks * block_size:
+        logger.error(
+            "The number of tokens is more than the number of blocks. "
+            "num_tokens=%d, num_blocks=%d, block_size=%d",
+            num_tokens,
+            num_blocks,
+            block_size,
+        )
+
+    block_ids_tensor = torch.tensor(block_ids, dtype=torch.long)
+    block_offsets = torch.arange(0, block_size, dtype=torch.long)
+    slot_mapping = (
+        block_offsets.reshape((1, block_size))
+        + block_ids_tensor.reshape((num_blocks, 1)) * block_size
+    )
+    slot_mapping = slot_mapping.flatten()[:num_tokens]
+    assert slot_mapping.dtype == torch.long  # TODO: this could be removed
+    return slot_mapping
+
+
+def _build_slot_mappings_by_group(
+    block_ids_by_group: tuple[list[int], ...],
+    block_sizes_by_group: tuple[int, ...],
+    num_tokens: int,
+) -> tuple[torch.Tensor, ...]:
+    if len(block_ids_by_group) != len(block_sizes_by_group):
+        raise ValueError(
+            "Block ids and block sizes group count mismatch: "
+            f"{len(block_ids_by_group)} vs {len(block_sizes_by_group)}"
+        )
+
+    return tuple(
+        _build_slot_mapping_for_group(group_block_ids, block_size, num_tokens)
+        for group_block_ids, block_size in zip(
+            block_ids_by_group, block_sizes_by_group, strict=True
+        )
+    )
+
+
 @dataclass
 class RequestTracker:
     # Request id
@@ -113,9 +238,9 @@ class RequestTracker:
     # The token ids that has been scheduled so far
     token_ids: list[int]
 
-    # The block ids that has been allocated so far
+    # The block ids that has been allocated so far, grouped by KV cache group.
     # NOTE: allocated blocks could be more than the number of tokens
-    allocated_block_ids: list[int]
+    allocated_block_ids_by_group: tuple[list[int], ...]
 
     # The number of tokens that has been saved
     num_saved_tokens: int = 0
@@ -139,6 +264,20 @@ class RequestTracker:
     # The number of tokens that are cached in LMCache for this request
     num_lmcache_cached_tokens: int = 0
 
+    @property
+    def num_kv_groups(self) -> int:
+        return len(self.allocated_block_ids_by_group)
+
+    def get_allocated_block_ids(self, group_idx: int) -> list[int]:
+        return self.allocated_block_ids_by_group[group_idx]
+
+    @property
+    def allocated_block_ids(self) -> list[int]:
+        assert self.num_kv_groups == 1, (
+            "allocated_block_ids is only valid for single-group requests"
+        )
+        return self.allocated_block_ids_by_group[0]
+
     @_lmcache_nvtx_annotate
     @staticmethod
     def from_new_request(
@@ -147,6 +286,7 @@ class RequestTracker:
         num_tokens_to_compute: int,
         lmcache_cached_tokens: int,
         skip_save: bool,
+        expected_num_groups: int = 1,
     ) -> "RequestTracker":
         """Create the request tracker from a new request.
 
@@ -161,24 +301,10 @@ class RequestTracker:
             request_priority (int): the priority of the request
             skip_save (bool): whether the request cache should be saved
         """
-        # vLLM 0.9.0 update: request.block_ids changed from list[int] to
-        # tuple[list[int]]
-        # Need to check the type of request.block_ids
-
-        unfolded_block_ids = []
-
-        if not isinstance(new_request.block_ids[0], list):
-            unfolded_block_ids = new_request.block_ids.copy()
-        else:
-            # According to the vLLM code
-            # (https://github.com/vllm-project/vllm/blob/main/vllm/v1/core/
-            # sched/scheduler.py#L943),
-            # only one KVCacheGroup is supported in connector for now.
-
-            # TODO: Please support multiple KVCacheGroup in connector.
-            # NOTE: Also, `update` method in RequestTracker should be
-            # updated accordingly.
-            unfolded_block_ids = new_request.block_ids[0].copy()
+        allocated_block_ids_by_group = _normalize_block_ids(
+            new_request.block_ids,
+            expected_num_groups,
+        )
 
         # NOTE: Initialized in `update_state_after_alloc`
         disagg_spec = tmp_disagg_tracker.pop(new_request.req_id, None)
@@ -191,7 +317,7 @@ class RequestTracker:
             req_id=new_request.req_id,
             prompt_len=len(new_request.prompt_token_ids),
             token_ids=new_request.prompt_token_ids[:num_tokens_to_compute].copy(),
-            allocated_block_ids=unfolded_block_ids,
+            allocated_block_ids_by_group=allocated_block_ids_by_group,
             num_saved_tokens=lmcache_cached_tokens,
             disagg_spec=disagg_spec,
             mm_hashes=mm_hashes,
@@ -204,7 +330,7 @@ class RequestTracker:
     def update(
         self,
         new_token_ids: list[int],
-        new_block_ids: Union[Optional[tuple[list[int], ...]], list[int]],
+        new_block_ids: BlockIdsLike,
         preempted: bool = False,
         lmcache_cached_tokens: int = 0,
         vllm_cached_tokens: int = 0,
@@ -219,32 +345,19 @@ class RequestTracker:
         restore token_ids for preempted requests to ensure chunk keys match
         """
 
-        if new_block_ids is None:
-            # https://github.com/vllm-project/vllm/commit/
-            # b029de9902aa3ac58806c8c17776c7074175b6db#
-            # diff-cafd89ce8a698a56acb24ada62831cbc7a980782f78a52d1742ba238031f296cL94
-            new_block_ids = []
-        elif len(new_block_ids) == 0:
-            new_block_ids = []
-        elif isinstance(new_block_ids, tuple):
-            new_block_ids = new_block_ids[0]
-        elif isinstance(new_block_ids, list):
-            # If input is a list, flatten it to handle potential nesting.
-            # This also correctly processes already-flat lists.
-            new_block_ids = [
-                i
-                for elem in new_block_ids
-                for i in (elem if isinstance(elem, list) else [elem])
-            ]
-        else:
-            raise ValueError(f"Unsupported new_block_ids type {type(new_block_ids)}")
+        # vLLM may pass None, a flat single-group list, or a grouped tuple/list
+        # depending on scheduler version and model cache layout.
+        new_block_ids_by_group = _normalize_block_ids(
+            new_block_ids,
+            self.num_kv_groups,
+        )
 
         if preempted:
             assert all_token_ids is not None, (
                 f"Preempted request {self.req_id} has no all_token_ids"
             )
             # the block ids will change after preemption
-            self.allocated_block_ids = new_block_ids
+            self.allocated_block_ids_by_group = new_block_ids_by_group
             # reset the number of saved tokens
             self.num_saved_tokens = lmcache_cached_tokens
             num_computed_tokens = max(lmcache_cached_tokens, vllm_cached_tokens)
@@ -259,7 +372,14 @@ class RequestTracker:
             )
             self.token_ids = all_token_ids[:num_tokens_needed]
         else:
-            self.allocated_block_ids.extend(new_block_ids)
+            merged_block_ids: list[list[int]] = []
+            for old_block_ids, group_block_ids in zip(
+                self.allocated_block_ids_by_group,
+                new_block_ids_by_group,
+                strict=True,
+            ):
+                merged_block_ids.append(old_block_ids + group_block_ids)
+            self.allocated_block_ids_by_group = tuple(merged_block_ids)
             self.token_ids.extend(new_token_ids)
 
         # When a request is scheduled again, and the number of new tokens
@@ -275,8 +395,10 @@ class ReqMeta:
     req_id: str
     # Request tokens
     token_ids: list[int]  # torch.Tensor
-    # Slot mapping
-    slot_mapping: torch.Tensor
+    # Slot mappings grouped by KV cache group.
+    slot_mappings_by_group: tuple[torch.Tensor, ...]
+    # Allocated block ids grouped by KV cache group.
+    allocated_block_ids_by_group: tuple[list[int], ...] = field(default_factory=tuple)
 
     # Whether is last prefill or not
     is_last_prefill: bool = False
@@ -290,10 +412,36 @@ class ReqMeta:
     # the configs of the request
     request_configs: Optional[dict] = None
 
+    @property
+    def num_kv_groups(self) -> int:
+        return len(self.slot_mappings_by_group)
+
+    def get_slot_mapping(self, group_idx: int) -> torch.Tensor:
+        return self.slot_mappings_by_group[group_idx]
+
+    @property
+    def slot_mapping(self) -> torch.Tensor:
+        assert self.num_kv_groups == 1, (
+            "slot_mapping is only valid for single-group requests"
+        )
+        return self.slot_mappings_by_group[0]
+
+    def get_allocated_block_ids(self, group_idx: int) -> list[int]:
+        return self.allocated_block_ids_by_group[group_idx]
+
+    @property
+    def allocated_block_ids(self) -> list[int]:
+        if not self.allocated_block_ids_by_group:
+            return []
+        assert len(self.allocated_block_ids_by_group) == 1, (
+            "allocated_block_ids is only valid for single-group requests"
+        )
+        return self.allocated_block_ids_by_group[0]
+
     @staticmethod
     def from_request_tracker(
         tracker: RequestTracker,
-        block_size: int,
+        block_sizes_by_group: Union[int, tuple[int, ...], list[int]],
         lmcache_chunk_size: int = 256,
         load_spec: Optional[LoadSpec] = None,
         discard_partial_chunks: bool = True,
@@ -303,7 +451,7 @@ class ReqMeta:
 
         Args:
             tracker (RequestTracker): the request tracker.
-            block_size (int): the block size in vLLM.
+            block_sizes_by_group: vLLM block size for each KV cache group.
             lmcache_chunk_size (int): the chunk size for LMCache.
             load_spec (Optional[LoadSpec]): the load spec for KV cache loading.
             discard_partial_chunks (bool): whether to discard partial chunks.
@@ -313,6 +461,10 @@ class ReqMeta:
             the request metadata if we need to perform load/save
             operations, None otherwise.
         """
+        block_sizes = _normalize_block_sizes(
+            block_sizes_by_group,
+            tracker.num_kv_groups,
+        )
         input_token_ids = tracker.token_ids
         input_token_len = len(input_token_ids)
 
@@ -377,31 +529,30 @@ class ReqMeta:
             )
             token_ids = token_ids.tolist()
 
-        num_blocks = len(tracker.allocated_block_ids)
+        for group_idx, (group_block_ids, block_size) in enumerate(
+            zip(tracker.allocated_block_ids_by_group, block_sizes, strict=True)
+        ):
+            num_blocks = len(group_block_ids)
+            if len(token_ids) > num_blocks * block_size:
+                logger.error(
+                    "The number of tokens is more than the number of blocks "
+                    "for request %s group %d. "
+                    "Something might be wrong in scheduling logic!",
+                    tracker.req_id,
+                    group_idx,
+                )
+                logger.error(
+                    "Num tokens: %d, num blocks: %d, block size: %d",
+                    len(token_ids),
+                    num_blocks,
+                    block_size,
+                )
 
-        if len(token_ids) > num_blocks * block_size:
-            logger.error(
-                "The number of tokens is more than the number of blocks"
-                " for request %s. "
-                "Something might be wrong in scheduling logic!",
-                tracker.req_id,
-            )
-            logger.error(
-                "Num tokens: %d, num blocks: %d, block size: %d",
-                len(token_ids),
-                num_blocks,
-                block_size,
-            )
-
-        block_ids = torch.tensor(tracker.allocated_block_ids, dtype=torch.long)
-        block_offsets = torch.arange(0, block_size, dtype=torch.long)
-        slot_mapping = (
-            block_offsets.reshape((1, block_size))
-            + block_ids.reshape((num_blocks, 1)) * block_size
+        slot_mappings_by_group = _build_slot_mappings_by_group(
+            tracker.allocated_block_ids_by_group,
+            block_sizes,
+            len(token_ids),
         )
-
-        slot_mapping = slot_mapping.flatten()[: len(token_ids)]
-        assert slot_mapping.dtype == torch.long  # TODO: this could be removed
 
         # For load operation: log if the request is scheduled to load
         if load_spec is not None and load_spec.can_load:
@@ -416,7 +567,11 @@ class ReqMeta:
         return ReqMeta(
             req_id=tracker.req_id,
             token_ids=token_ids,
-            slot_mapping=slot_mapping,
+            slot_mappings_by_group=slot_mappings_by_group,
+            allocated_block_ids_by_group=tuple(
+                list(group_block_ids)
+                for group_block_ids in tracker.allocated_block_ids_by_group
+            ),
             is_last_prefill=is_last_prefill,
             save_spec=save_spec,
             load_spec=load_spec,
@@ -539,6 +694,19 @@ class LMCacheConnectorV1Impl:
 
         self.kv_caches: dict[str, torch.Tensor] = {}
         self._block_size = vllm_config.cache_config.block_size
+        self._kv_cache_config = getattr(self._parent, "_kv_cache_config", None)
+        if self._kv_cache_config is not None:
+            self._num_kv_groups = len(self._kv_cache_config.kv_cache_groups)
+            self._block_sizes_by_group = tuple(
+                group.kv_cache_spec.block_size
+                for group in self._kv_cache_config.kv_cache_groups
+            )
+        else:
+            self._num_kv_groups = 1
+            self._block_sizes_by_group = (self._block_size,)
+
+        # Backward-compatible alias for legacy single-group code paths.
+        self._block_size = self._block_sizes_by_group[0]
         self.load_specs: dict[str, LoadSpec] = {}
         self.kv_cache_manager: Optional["KVCacheManager"] = None
         self._request_trackers: dict[str, RequestTracker] = {}
@@ -1474,12 +1642,13 @@ class LMCacheConnectorV1Impl:
                 num_tokens_to_compute,
                 lmcache_cached_tokens,
                 skip_save,
+                self._num_kv_groups,
             )
             self._request_trackers[request.req_id] = request_tracker
 
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
-                self._block_size,
+                self._block_sizes_by_group,
                 self._lmcache_chunk_size,
                 load_spec=load_spec,
                 discard_partial_chunks=self._discard_partial_chunks,
@@ -1525,7 +1694,7 @@ class LMCacheConnectorV1Impl:
 
                 req_meta = ReqMeta.from_request_tracker(
                     request_tracker,
-                    self._block_size,
+                    self._block_sizes_by_group,
                     self._lmcache_chunk_size,
                     load_spec=load_spec,
                     discard_partial_chunks=self._discard_partial_chunks,
@@ -1546,6 +1715,11 @@ class LMCacheConnectorV1Impl:
                 # num_computed_tokens < tracker_len after preemption.
                 tracker_len = len(request_tracker.token_ids)
                 slice_base = min(num_current_tokens, tracker_len)
+                if hasattr(scheduler_output, "scheduled_spec_decode_tokens"):
+                    num_new_tokens -= len(
+                        scheduler_output.scheduled_spec_decode_tokens.get(req_id, ())
+                    )
+                    num_new_tokens = max(0, num_new_tokens)
                 new_token_ids = request.all_token_ids[
                     slice_base : slice_base + num_new_tokens
                 ]
@@ -1614,8 +1788,13 @@ class LMCacheConnectorV1Impl:
                     len(request_tracker.token_ids),
                     num_current_tokens,
                 )
-                num_token_slots = (
-                    len(request_tracker.allocated_block_ids) * self._block_size
+                num_token_slots = min(
+                    len(group_block_ids) * block_size
+                    for group_block_ids, block_size in zip(
+                        request_tracker.allocated_block_ids_by_group,
+                        self._block_sizes_by_group,
+                        strict=True,
+                    )
                 )
                 tokens_to_keep = num_current_tokens
                 if num_token_slots < num_current_tokens:
@@ -1648,7 +1827,7 @@ class LMCacheConnectorV1Impl:
 
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
-                self._block_size,
+                self._block_sizes_by_group,
                 self._lmcache_chunk_size,
                 load_spec=load_spec,
                 discard_partial_chunks=self._discard_partial_chunks,
