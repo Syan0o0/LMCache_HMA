@@ -267,6 +267,8 @@ class LocalDiskBackend(StorageBackendInterface):
         dtype: torch.dtype,
         fmt: MemoryFormat,
         cached_positions: Optional[torch.Tensor] = None,
+        shapes: Optional[list[torch.Size]] = None,
+        dtypes: Optional[list[torch.dtype]] = None,
     ) -> None:
         path = self._key_to_path(key)
 
@@ -278,7 +280,15 @@ class LocalDiskBackend(StorageBackendInterface):
                 has_stored = True
             else:
                 self.dict[key] = DiskCacheMetadata(
-                    path, size, shape, dtype, cached_positions, fmt, 0
+                    path,
+                    size,
+                    shape,
+                    dtype,
+                    cached_positions,
+                    fmt,
+                    0,
+                    shapes,
+                    dtypes,
                 )
 
         # Push kv admit msg with batching
@@ -303,7 +313,9 @@ class LocalDiskBackend(StorageBackendInterface):
             after the disk write completes. Callback exceptions are caught
             and logged.
         """
-        assert memory_obj.tensor is not None
+        if not memory_obj.is_valid():
+            logger.warning("Skipping disk put for invalid MemoryObj: %s", key)
+            return None
 
         # skip repeated save
         if self.exists_in_put_tasks(key):
@@ -397,12 +409,24 @@ class LocalDiskBackend(StorageBackendInterface):
         dtype = disk_meta.dtype
         shape = disk_meta.shape
         fmt = disk_meta.fmt
+        shapes = disk_meta.shapes
+        dtypes = disk_meta.dtypes
         assert dtype is not None
         assert shape is not None
+        if shapes is None:
+            shapes = [shape]
+        if dtypes is None:
+            dtypes = [dtype]
 
         self.disk_lock.release()
         memory_obj = self.load_bytes_from_disk(
-            key, path, dtype=dtype, shape=shape, fmt=fmt
+            key,
+            path,
+            dtype=dtype,
+            shape=shape,
+            fmt=fmt,
+            shapes=shapes,
+            dtypes=dtypes,
         )
 
         return memory_obj
@@ -425,16 +449,22 @@ class LocalDiskBackend(StorageBackendInterface):
             dtype = self.dict[key].dtype
             shape = self.dict[key].shape
             fmt = self.dict[key].fmt
+            shapes = self.dict[key].shapes
+            dtypes = self.dict[key].dtypes
 
             assert dtype is not None
             assert shape is not None
+            if shapes is None:
+                shapes = [shape]
+            if dtypes is None:
+                dtypes = [dtype]
 
             # busy_loop=False prevents spinning on the event loop thread;
             # if staging memory is exhausted the caller will get a logged
             # error rather than a silent deadlock.
             memory_obj = self.local_cpu_backend.allocate(
-                shape,
-                dtype,
+                shapes,
+                dtypes,
                 fmt,
                 busy_loop=False,
             )
@@ -500,8 +530,6 @@ class LocalDiskBackend(StorageBackendInterface):
             write completes for this key. Callback exceptions are caught and
             logged.
         """
-        kv_chunk = memory_obj.tensor
-        assert kv_chunk is not None
         buffer = memory_obj.byte_array
         path = self._key_to_path(key)
 
@@ -523,9 +551,20 @@ class LocalDiskBackend(StorageBackendInterface):
         dtype = memory_obj.metadata.dtype
         fmt = memory_obj.metadata.fmt
         cached_positions = memory_obj.metadata.cached_positions
+        shapes = memory_obj.metadata.shapes
+        dtypes = memory_obj.metadata.dtypes
         memory_obj.ref_count_down()
 
-        self.insert_key(key, size, shape, dtype, fmt, cached_positions=cached_positions)
+        self.insert_key(
+            key,
+            size,
+            shape,
+            dtype,
+            fmt,
+            cached_positions=cached_positions,
+            shapes=shapes,
+            dtypes=dtypes,
+        )
 
         self.disk_worker.remove_put_task(key)
 
@@ -571,12 +610,19 @@ class LocalDiskBackend(StorageBackendInterface):
         dtype: torch.dtype,
         shape: torch.Size,
         fmt: MemoryFormat,
+        shapes: Optional[list[torch.Size]] = None,
+        dtypes: Optional[list[torch.dtype]] = None,
     ) -> Optional[MemoryObj]:
         """
         Load bytearray from disk.
         """
 
-        memory_obj = self.local_cpu_backend.allocate(shape, dtype, fmt)
+        if shapes is None:
+            shapes = [shape]
+        if dtypes is None:
+            dtypes = [dtype]
+
+        memory_obj = self.local_cpu_backend.allocate(shapes, dtypes, fmt)
         assert memory_obj is not None, "Memory allocation failed during disk load."
 
         buffer = memory_obj.byte_array
